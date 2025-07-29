@@ -1,0 +1,198 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// --- Banner ---
+func printBanner() {
+	fmt.Println(`
+           0000000000000000000            0000000000000000000           
+            0000000000000000000          0000000000000000000            
+             0000000000000000000        0000000000000000005             
+              0000000000000000000     4000000000000000000               
+                000000000000000000   0000000000000000000                
+                 00000000000000000000000000000000000000                 
+                  000000000000000000000000000000000000                  
+                   0000000          0000000000000000                    
+                    90000              000000000000                     
+                      000              00000000000                      
+                       000000          0000000000                       
+                            0000000    000000000                        
+                         00      00000000000000                         
+                          0000003      0000000                          
+                          0000000000    0000    Telegram id: https:@jackleet
+                             00     0200000 0000                         
+                              0 30  0  0000000000                       
+                      0        00   00000000000000                      
+                    5000        000 000000000000000                     
+                   000000         000000000000000000                    
+                  000000000        0000000000000000000                  
+                 00000000000000000000000000000000000000                 
+                0000000000000000002  0000000000000000000                
+              0000000000000000000     0000000000000000000               
+             0000000000000000000        000000000000000000              
+            0000000000000000000          000000000000000000            
+           0000000000000000000            Wordpress Filter V__2025      By: Mr X
+`)
+}
+
+// --- Input helper ---
+func inputIntWithDefault(prompt string, defaultVal, minVal, maxVal int) int {
+	fmt.Print(prompt)
+	var input string
+	fmt.Scanln(&input)
+	if input == "" {
+		return defaultVal
+	}
+	val, err := strconv.Atoi(input)
+	if err != nil || val < minVal || val > maxVal {
+		fmt.Printf("Invalid input, using default %d\n", defaultVal)
+		return defaultVal
+	}
+	return val
+}
+
+// --- Count lines in file (streaming) ---
+func countLines(filename string) int {
+	f, err := os.Open(filename)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	total := 0
+	for scanner.Scan() {
+		total++
+	}
+	return total
+}
+
+// --- Homepage check ---
+func homepageHasWPContent(url string, client *http.Client) bool {
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return false
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), "/wp-content/") {
+			return true
+		}
+	}
+	return false
+}
+
+// --- readme.txt check ---
+func contentHasKeyword(url, keyword string, client *http.Client) bool {
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return false
+	}
+	buf := make([]byte, 1024*1024) // read up to 1MB
+	n, _ := resp.Body.Read(buf)
+	if n == 0 {
+		return false
+	}
+	return strings.Contains(string(buf[:n]), keyword)
+}
+
+// --- Main ---
+func main() {
+	printBanner()
+
+	var filename string
+	fmt.Print("Enter sites list filename: ")
+	fmt.Scanln(&filename)
+
+	threadNum := inputIntWithDefault("Enter number of threads (default 100, max 500): ", 100, 1, 500)
+	timeoutSec := inputIntWithDefault("Enter timeout in seconds (default 5, max 20): ", 5, 1, 20)
+
+	// Count total lines (so we can print [current|total])
+	totalLines := countLines(filename)
+	fmt.Printf("Total lines in file: %d\n", totalLines)
+
+	file, err := os.Open(filename)
+	if err != nil {
+		fmt.Println("Error opening file:", err)
+		return
+	}
+	defer file.Close()
+
+	outFile, err := os.Create("wordpress.txt")
+	if err != nil {
+		fmt.Println("Error creating output file:", err)
+		return
+	}
+	defer outFile.Close()
+	writer := bufio.NewWriter(outFile)
+	defer writer.Flush()
+
+	client := &http.Client{Timeout: time.Duration(timeoutSec) * time.Second}
+
+	sem := make(chan struct{}, threadNum)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	uniqueSites := make(map[string]struct{})
+
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+
+	for scanner.Scan() {
+		site := strings.TrimSpace(scanner.Text())
+		if site == "" {
+			continue
+		}
+		if !strings.HasPrefix(site, "http") {
+			site = "http://" + site
+		}
+
+		lineNum++
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(line int, site string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			isWP := homepageHasWPContent(site+"/", client)
+			if !isWP {
+				readmeURL := site + "/wp-includes/ID3/readme.txt"
+				isWP = contentHasKeyword(readmeURL, "getID3()", client)
+			}
+
+			mu.Lock()
+			if isWP {
+				if _, exists := uniqueSites[site]; !exists {
+					uniqueSites[site] = struct{}{}
+					writer.WriteString(site + "\n")
+					writer.Flush()
+					fmt.Printf("[%d|%d] %s --> WordPress\n", line, totalLines, site)
+				}
+			} else {
+				fmt.Printf("[%d|%d] %s --> Not WordPress\n", line, totalLines, site)
+			}
+			mu.Unlock()
+		}(lineNum, site)
+	}
+
+	wg.Wait()
+	fmt.Println("Scan complete! Unique WordPress sites saved to wordpress.txt")
+}
